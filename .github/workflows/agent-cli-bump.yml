@@ -1,0 +1,158 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Agent-CLI release watcher: polls copilot-cli + opencode releases weekly
+# and opens a DRAFT pin-bump PR with a deterministic suitability report.
+# Humans keep the merge decision and every live-validation step (inference,
+# Free-tier spend, hook-marker proofs, behavioral judgment). Never merges.
+name: Agent-CLI release watcher
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: agent-cli-bump
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    name: Poll releases for new stable versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      copilot_new: ${{ steps.check.outputs.copilot_new }}
+      opencode_new: ${{ steps.check.outputs.opencode_new }}
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Compare latest stable tags against pins
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          check_one() {
+            local api_repo="$1" pin="$2"
+            local tag prerelease draft
+            tag="$(gh api "repos/$api_repo/releases/latest" --jq '.tag_name')"
+            prerelease="$(gh api "repos/$api_repo/releases/latest" --jq '.prerelease')"
+            draft="$(gh api "repos/$api_repo/releases/latest" --jq '.draft')"
+            if [[ "$prerelease" == "true" || "$draft" == "true" ]]; then
+              echo ""
+              return
+            fi
+            local ver="${tag#v}"
+            if [[ "$ver" != "$pin" ]]; then
+              echo "$ver"
+            else
+              echo ""
+            fi
+          }
+          copilot_pin="$(grep -o 'requires exactly GitHub Copilot CLI [0-9.]*' src/skillspector/providers/_agent_cli.py 2>/dev/null | head -1 | grep -o '[0-9.]*$' || true)"
+          opencode_pin="$(grep -o '_OPENCODE_SUPPORTED_VERSION = "[0-9.]*"' src/skillspector/providers/_agent_cli.py | grep -o '[0-9.]*')"
+          if [[ -z "$copilot_pin" ]]; then
+            echo "::notice::No copilot pin literal on this branch; skipping copilot leg."
+          else
+            echo "copilot_new=$(check_one github/copilot-cli "$copilot_pin")" >> "$GITHUB_OUTPUT"
+          fi
+          echo "opencode_new=$(check_one anomalyco/opencode "$opencode_pin")" >> "$GITHUB_OUTPUT"
+
+  bump:
+    name: Draft bump PR
+    needs: poll
+    if: needs.poll.outputs.copilot_new != '' || needs.poll.outputs.opencode_new != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: lts/*
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Build suitability report and scaffold bump
+        shell: bash
+        run: |
+          set -euo pipefail
+          for spec in "copilot:${{ needs.poll.outputs.copilot_new }}:github/copilot-cli" \
+                      "opencode:${{ needs.poll.outputs.opencode_new }}:anomalyco/opencode"; do
+            cli="${spec%%:*}"; rest="${spec#*:}"; ver="${rest%%:*}"; repo="${rest##*:}"
+            [[ -z "$ver" ]] && continue
+            echo "Processing $cli -> $ver"
+            # Release body for the keyword scan.
+            gh api "repos/$repo/releases/latest" --jq '.body' > "/tmp/$cli-body.md"
+            # Install the NEW cli in the sandbox for --help capture.
+            if [[ "$cli" == "copilot" ]]; then
+              npm install -g "@github/copilot@$ver" || echo "::warning::copilot install failed; help diff skipped"
+              copilot --help 2>&1 > "/tmp/$cli-new-help.txt" || true
+            else
+              curl -fsSL https://gh.io/opencode-install | VERSION="v$ver" bash || echo "::warning::opencode install failed; help diff skipped"
+              opencode run --help 2>&1 > "/tmp/$cli-new-help.txt" || true
+            fi
+            old_pin="$(grep -o '_OPENCODE_SUPPORTED_VERSION = "[0-9.]*"' src/skillspector/providers/_agent_cli.py | grep -o '[0-9.]*')"
+            if [[ "$cli" == "copilot" ]]; then
+              old_pin="$(grep -o 'requires exactly GitHub Copilot CLI [0-9.]*' src/skillspector/providers/_agent_cli.py | head -1 | grep -o '[0-9.]*$')"
+            fi
+            python scripts/check_release_suitability.py --cli "$cli" --old "$old_pin" --new "$ver" \
+              --help-file "/tmp/$cli-new-help.txt" \
+              --baseline "tests/fixtures/$cli-$old_pin--help.txt" \
+              --body-file "/tmp/$cli-body.md" \
+              --report "suitability-$cli-$ver.md" || true
+            # Scaffold the bump: pin literals in the known pin-carrying
+            # files only (never grep -rl: CHANGELOG history and prose
+            # mention old versions that must not be rewritten).
+            for f in src/skillspector/providers/_agent_cli.py \
+                     tests/provider/test_copilot_cli.py \
+                     tests/provider/test_opencode_cli.py \
+                     README.md docs/DEVELOPMENT.md; do
+              [[ -f "$f" ]] || continue
+              sed -i "s/$(printf '%s' "$old_pin" | sed 's/\./\\./g')/$ver/g" "$f"
+            done
+            cp "/tmp/$cli-new-help.txt" "tests/fixtures/$cli-$ver--help.txt" || true
+          done
+      - name: Open draft PR
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          for report in suitability-*.md; do
+            [[ -f "$report" ]] || continue
+            ver="$(echo "$report" | grep -o '[0-9][0-9.]*' | head -1)"
+            cli="copilot"; [[ "$report" == *opencode* ]] && cli="opencode"
+            branch="chore/bump-$cli-$ver"
+            if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+              echo "Branch $branch already open; skipping."
+              continue
+            fi
+            git checkout -b "$branch"
+            git add -A
+            git commit -s -m "chore(providers): bump supported $cli to $ver (bot draft)" -m "Automated bump scaffold; suitability report in the PR body. Human live validation required before merge." || { git checkout main 2>/dev/null || git checkout -; continue; }
+            git push -u origin "$branch"
+            gh pr create --draft --title "Bump supported $cli to $ver (bot draft, needs live validation)" \
+              --body-file "$report" --base main --head "$branch"
+            git checkout - || true
+          done
